@@ -1,0 +1,100 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+const char* AP_SSID = "TAG_REMOTE";
+const char* AP_PASS = "12345678";
+static const int ESPNOW_CHANNEL = 1;
+
+#ifndef RGB_BUILTIN
+#define RGB_BUILTIN 48
+#endif
+
+typedef struct __attribute__((packed)) {
+  uint8_t cmd;
+  uint8_t value;
+} Msg;
+
+extern "C" void neopixelWrite(uint8_t pin, uint8_t red, uint8_t green, uint8_t blue);
+
+void showRGB(uint8_t r, uint8_t g, uint8_t b) {
+  neopixelWrite((uint8_t)RGB_BUILTIN, r, g, b);
+}
+
+void applyPattern(uint8_t c) {
+  switch (c) {
+    case 0: showRGB(0, 0, 0); break;
+    case 1: showRGB(255, 0, 0); break;
+    case 2: showRGB(0, 255, 0); break;
+    case 3: showRGB(0, 0, 255); break;
+    case 4:
+      for (int i = 0; i < 3; i++) {
+        showRGB(200, 200, 200); delay(150);
+        showRGB(0, 0, 0);       delay(150);
+      }
+      break;
+  }
+}
+
+String macBytesToString(const uint8_t* mac) {
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+String getStaMac() {
+  uint8_t mac[6];
+  esp_wifi_get_mac(WIFI_IF_STA, mac);
+  return macBytesToString(mac);
+}
+
+void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(Msg)) return;
+  Msg m; memcpy(&m, data, sizeof(m));
+  if (m.cmd == 0) {
+    Serial.print("Received pattern: ");
+    Serial.println(m.value);
+    applyPattern(m.value);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== Name Tag Boot ===");
+
+  WiFi.mode(WIFI_STA);
+
+  // ✅ Correct MAC read on ESP32-S3
+  Serial.print("REAL TAG MAC (STA): ");
+  Serial.println(getStaMac());
+
+  WiFi.begin(AP_SSID, AP_PASS);
+
+  Serial.print("Connecting to controller AP");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    if (millis() - start > 15000) {
+      Serial.println("\n❌ Failed to join AP");
+      break;
+    }
+  }
+
+  Serial.println();
+  Serial.print("STA IP: "); Serial.println(WiFi.localIP());
+  Serial.print("Channel: "); Serial.println(WiFi.channel());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ esp_now_init failed");
+    while (true) delay(1000);
+  }
+  esp_now_register_recv_cb(onRecv);
+  Serial.println("✅ ESP-NOW receiver ready");
+
+  showRGB(0, 0, 40);
+}
+
+void loop() {}
