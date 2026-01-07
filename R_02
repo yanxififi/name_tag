@@ -1,0 +1,181 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_err.h>
+
+// ===== Config =====
+static const int ESPNOW_CHANNEL = 1;
+const char* AP_SSID = "TAG_REMOTE";
+const char* AP_PASS = "12345678";
+
+WebServer server(80);
+
+// ===== Replace with REAL tag MAC addresses =====
+uint8_t TAG1_MAC[] = {0xD0,0xCF,0x13,0x43,0x6B,0x58};  // <-- replace D0:CF:13:43:6B:58
+uint8_t TAG2_MAC[] = {0xD0,0xCF,0x13,0x44,0x39,0x5C};  // <-- replace D0:CF:13:44:39:5C
+// =============================================
+
+typedef struct __attribute__((packed)) {
+  uint8_t cmd;   // 0=setPattern
+  uint8_t value; // 0..4
+} Msg;
+
+String macToString(const uint8_t* mac) {
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+bool addPeer(const uint8_t* mac) {
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = ESPNOW_CHANNEL;
+  peer.encrypt = false;
+  peer.ifidx = WIFI_IF_STA; // safest on S3
+
+  esp_err_t r = esp_now_add_peer(&peer);
+  if (r == ESP_OK || r == ESP_ERR_ESPNOW_EXIST) return true;
+
+  Serial.printf("add_peer %s failed: %s (%d)\n",
+                macToString(mac).c_str(), esp_err_to_name(r), (int)r);
+  return false;
+}
+
+// ✅ NEW callback signature for IDF v5 / newer Arduino-ESP32
+void onSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  const uint8_t* mac = info->des_addr;
+  Serial.printf("DELIVERY to %02X:%02X:%02X:%02X:%02X:%02X -> %s\n",
+    mac[0],mac[1],mac[2],mac[3],mac[4],mac[5],
+    status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+}
+
+esp_err_t sendToOne(const uint8_t* mac, uint8_t p) {
+  Msg m{0, p};
+  esp_err_t r = esp_now_send(mac, (uint8_t*)&m, sizeof(m));
+  Serial.printf("Send to %s pattern %d -> %s (%d)\n",
+                macToString(mac).c_str(), p, esp_err_to_name(r), (int)r);
+  return r;
+}
+
+void sendToBoth(uint8_t p) {
+  sendToOne(TAG1_MAC, p);
+  sendToOne(TAG2_MAC, p);
+}
+
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Name Tag Remote</title>
+<style>
+  body{font-family:Arial;padding:18px}
+  .row{margin:10px 0}
+  button{padding:14px 16px;margin:8px 10px 0 0;font-size:16px}
+  #log{background:#f4f4f4;padding:10px;border-radius:10px;min-height:80px;white-space:pre-wrap}
+</style></head><body>
+<h2>Name Tag Remote</h2>
+
+<div class="row"><b>Pick target:</b></div>
+<div class="row">
+  <button onclick="setTarget('all')">Send to BOTH</button>
+  <button onclick="setTarget('1')">Tag 1 only</button>
+  <button onclick="setTarget('2')">Tag 2 only</button>
+</div>
+
+<div class="row"><b>Pick pattern:</b></div>
+<div class="row">
+  <button onclick="sendC(0)">0 OFF</button>
+  <button onclick="sendC(1)">1</button>
+  <button onclick="sendC(2)">2</button>
+  <button onclick="sendC(3)">3</button>
+  <button onclick="sendC(4)">4</button>
+</div>
+
+<div class="row"><b>Log</b></div>
+<div id="log">Target = BOTH</div>
+
+<script>
+let target = "all";
+const log = (m) => document.getElementById("log").textContent = m;
+
+function setTarget(t){
+  target = t;
+  log("Target = " + (t==="all" ? "BOTH" : ("Tag "+t)));
+}
+
+async function sendC(c){
+  try{
+    const r = await fetch(`/set?t=${target}&c=${c}`);
+    log(await r.text());
+  }catch(e){
+    log("ERROR: " + e);
+  }
+}
+</script>
+</body></html>
+)HTML";
+
+void handleRoot() { server.send(200, "text/html", INDEX_HTML); }
+
+void handleSet() {
+  if (!server.hasArg("c")) {
+    server.send(400, "text/plain", "Missing ?c=0..4");
+    return;
+  }
+
+  int c = server.arg("c").toInt();
+  if (c < 0 || c > 4) {
+    server.send(400, "text/plain", "c must be 0..4");
+    return;
+  }
+
+  String t = server.hasArg("t") ? server.arg("t") : "all";
+
+  if (t == "1") {
+    sendToOne(TAG1_MAC, (uint8_t)c);
+    server.send(200, "text/plain", "Sent to Tag1: c=" + String(c));
+  } else if (t == "2") {
+    sendToOne(TAG2_MAC, (uint8_t)c);
+    server.send(200, "text/plain", "Sent to Tag2: c=" + String(c));
+  } else {
+    sendToBoth((uint8_t)c);
+    server.send(200, "text/plain", "Sent to BOTH: c=" + String(c));
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== Controller (Single Target UI) ===");
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS, ESPNOW_CHANNEL);
+
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+  Serial.println("Open: http://192.168.4.1");
+
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ esp_now_init failed");
+    while (true) delay(1000);
+  }
+
+  esp_now_register_send_cb(onSent);
+  Serial.println("✅ ESP-NOW init ok");
+
+  addPeer(TAG1_MAC);
+  addPeer(TAG2_MAC);
+
+  server.on("/", handleRoot);
+  server.on("/set", handleSet);
+  server.begin();
+  Serial.println("✅ Web server started");
+}
+
+void loop() {
+  server.handleClient();
+}
